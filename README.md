@@ -30,8 +30,8 @@ are not encrypted.
 
 Key management middleware is responsible for setting the WSGI environment's
 ``encryption_params`` sub-dictionary, including at a minimum a dictionary
-key named ``encryption_key_generator``.  ``encryption`` middleware is
-responsible for calling ``encryption_key_generator`` to get a key, and
+key named ``secret_generator``.  ``encryption`` middleware is
+responsible for calling ``secret_generator`` to get a key, and
 encrypting/decrypting the requested object using that key.
 
 Any GET or PUT object requests which are issued when the WSGI environment's

@@ -46,8 +46,8 @@ are not encrypted.
 
 Key management middleware is responsible for setting the WSGI environment's
 ``encryption_params`` sub-dictionary, including at a minimum a dictionary
-key named ``key_generator``.  ``encryption`` middleware is
-responsible for calling ``key_generator`` to get a key, and
+key named ``secret_generator``.  ``encryption`` middleware is
+responsible for calling ``secret_generator`` to get a key, and
 encrypting/decrypting the requested object using that key.
 
 Any GET or PUT object requests which are issued when the WSGI environment's
@@ -59,8 +59,24 @@ proxy resources.
     [pipeline:main]
     pipeline = catch_errors cache tempauth trivial_key_mgmt encryption proxy-server
 
-Caveats:
+The ``encryption`` middleware configuration section takes two optional
+parameters: ``cipher_name`` and ``cipher_mode``.  Both come from the pycrypto
+package's Crypto module.  Valid cipher names include:
+  AES, ARC2, ARC4, Blowfish, CAST, DES, DES3, PKCS1_OAEP, PKCS1_v1_5, XOR
+Valid modes include:
+  CBC, CFB, CTR, ECB, OFB
 
+Sample configuration section:
+
+[filter:encryption]
+cipher_name = AES
+cipher_mode = CTR
+
+In absence of a strong reason, we recommend going with the defaults of AES and
+CTR.  CTR allows Swift's range requests to be efficient even on encrypted
+data.
+
+Caveats:
  * Encryption is CPU-intensive.  Adding this middleware to your pipeline will
    greatly increase the CPU demands of your proxy servers.
 
@@ -73,8 +89,10 @@ from swift.common.swob import wsgify
 from swift.common.utils import register_swift_info, get_logger
 from swift.proxy.controllers.base import get_container_info
 
-# Object metadata header that specifies the current revision
-REVS_HEADER = 'X-Object-Meta-Revision-Reference'
+try:
+    from Crypto import Cipher
+except ImportError:
+    raise HTTPInternalServerError('pycrypto not installed on proxy server')
 
 
 class EncryptionMiddleware(object):
@@ -87,7 +105,17 @@ class EncryptionMiddleware(object):
         self.app = app
         self.conf = conf
         self.logger = get_logger(conf, name='encryption')
+        self.cipher_name = conf.get('cipher_name', 'AES')
+        self.cipher_modename = conf.get('cipher_mode', 'CTR')
 
+        try:
+            module = __import__('Crypto.Cipher.%s' % self.cipher_name)
+            setattr('Cipher', self.cipher_name, module)
+            self.cipher_class = getattr(module, '%sCipher' % self.cipher_class)
+            self.cipher_mode = module.get('MODE_%s' % self.cipher_modename)
+        except ImportError:
+            raise HTTPInternalServerError('Failed to import Crypto.Cipher.%s'
+                                          % self.cipher_name)
 
     @wsgify
     def __call__(self, req):
@@ -99,61 +127,32 @@ class EncryptionMiddleware(object):
           # account or container GET/PUT
           return self.app
 
-        params = req.environ['encryption_params']
-        key = params['key_generator'](req)
-        encrypt = 
-        # ^^^
-
-        not_blank = lambda somestr: somestr != ''
-        bz = BZ2Compressor()
-        compressed = chain((bz.compress(i) for i in env['wsgi.input']),
-                           (bz.flush() for i in (1,)))
-        env['wsgi.input'] = ifilter(not_blank, compressed)
-        return self.app(env, start_response)
-
         if 'encryption_params' not in req.environ:
             raise swob.HTTPServiceUnavailable(
                 'At-rest encryption improperly configured')
 
-        if req.method != 'PUT':
-            # We'll need the manifest info for anything other than a PUT
-            # (For a PUT, we'll just overwrite it)
-            revname = self.subreq.get_revision_name_from_manifest(req)
-            self.logger.info('Retrieved manifest: /%s/%s/%s -> %s/%s' % (
-                    acct, cont, obj, revs_cont, revname))
-
-        if req.method in ('HEAD', 'GET'):
-            # Return the result of sending the request to the new URL
-            new_path = '/%s/%s/%s/%s' % (ver, acct, revs_cont, revname)
-            req.environ['PATH_INFO'] = new_path
-            return self.app
-
-        # This is a POST/PUT request on an object with a revisions container.
-
-        # First step: Send the request to the revisions container.
-        if req.environ['REQUEST_METHOD'] == 'PUT':
-            # Create a new object in the Revisions-Location container
-            new_obj = '%s.%s' % (obj, time.time())
+        params = req.environ['encryption_params']
+        secrets = params['secret_generator'](req)
+        if type(secrets) is tuple and len(secrets) == 2:
+            key, iv = secrets
+        elif type(secrets) is bytes:
+            key, iv = secrets, None
         else:
-            # We're POSTing data.  Which object in the revisions container?
-            #   Whatever the manifest tells us.
-            new_obj = revname
-        status, headers, body = self.subreq.put_or_post(
-            req.environ, ver, acct, revs_cont, new_obj)
+            raise swob.HTTPInternalServerError(
+                'encryption: secrets() returned unexpected value')
 
-        # Was this a PUT?  If so, update the manifest.
-        if req.method == 'PUT':
-            self.subreq.update_manifest(req, new_obj)
-            self.logger.info('Updated manifest: /%s/%s/%s -> %s/%s' % (
-                    acct, cont, obj, revs_cont, new_obj))
-
-        # For either PUT or POST, return the result of the operation in the
-        # revisions container, assuming we haven't yet errored out.
-        return swob.Response(status=status, headers=headers, body=body)
+        # TODO:
+        #  * pad input to block length if necessary
+        #  * deal with offsets in range requests
+        cipher = self.cipher_class.new(key, self.cipher_mode, iv=iv)
+        env['wsgi.input'] = (cipher.encrypt(i) for i in env['wsgi.input'])
+        return self.app(env, start_response)
 
 
 def filter_factory(global_conf, **local_conf):
     """Returns a WSGI filter app for use with paste.deploy."""
-    register_swift_info('revisions')
     conf = dict(global_conf, **local_conf)
-    return lambda app: RevisionsMiddleware(app, conf)
+    conf.setdefault('cipher_name', 'AES')
+    conf.setdefault('cipher_mode', 'CTR')
+    register_swift_info('encryption', conf)
+    return lambda app: EncryptionMiddleware(app, conf)
